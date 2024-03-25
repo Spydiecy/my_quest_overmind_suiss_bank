@@ -102,8 +102,9 @@ module quest_overmind::lending {
     use sui::balance::{Self, Balance};
 
     //==============================================================================================
-    // Constants - Add your constants here (if any)
+    // Constants
     //==============================================================================================
+    const LIQUIDATION_THRESHOLD: u64 = 80; // Liquidation threshold in percentage
 
     //==============================================================================================
     // Error codes - DO NOT MODIFY
@@ -193,10 +194,12 @@ module quest_overmind::lending {
         Creates a new pool for a new coin type. This function can only be called by the admin.
     */
     public fun create_pool<CoinType>(
-        _: &mut AdminCap,
+        admin_cap: &mut AdminCap,
         state: &mut ProtocolState,
         ctx: &mut TxContext
     ) {
+        assert!(tx_context::sender(ctx) == object::address_from_id(id(&admin_cap.id)), "Only the admin can create new pools");
+
         transfer::share_object(Pool{
             id: object::new(ctx),
             asset_number: state.number_of_pools,
@@ -254,15 +257,13 @@ module quest_overmind::lending {
         amount_to_withdraw: u64, 
         pool: &mut Pool<CoinType>,
         state: &mut ProtocolState,
-        ctx: &mut TxContext
+        ctx: &mut TxContext,
+        price_feed: &dummy_oracle::PriceFeed
     ): Coin<CoinType> {
-
         let sender = tx_context::sender(ctx);
-
-        let real_amount_to_withdraw = 0;
+        let real_amount_to_withdraw = amount_to_withdraw;
 
         if (table::contains(&state.users, sender)) {
-
             let userData = table::borrow_mut(&mut state.users, sender);
 
             if (table::contains(&userData.collateral_amount, pool.asset_number)) {
@@ -272,9 +273,13 @@ module quest_overmind::lending {
 
                 *amount = *amount - amount_to_withdraw;
 
-                real_amount_to_withdraw = amount_to_withdraw;
+                // Check if the user's health factor will remain above the liquidation threshold
+                let new_health_factor = calculate_health_factor(sender, state, price_feed);
+                assert!(new_health_factor >= LIQUIDATION_THRESHOLD, "Withdrawal would cause the user's health factor to fall below the liquidation threshold");
+            } else {
+                real_amount_to_withdraw = 0;
             }
-        };
+        }
 
         let amount_to_withdraw_balance = balance::split(
             &mut pool.reserve, real_amount_to_withdraw);
@@ -290,30 +295,33 @@ module quest_overmind::lending {
         amount_to_borrow: u64, 
         pool: &mut Pool<CoinType>,
         state: &mut ProtocolState,
-        ctx: &mut TxContext
+        ctx: &mut TxContext,
+        price_feed: &dummy_oracle::PriceFeed
     ): Coin<CoinType> {
+        let sender = tx_context::sender(ctx);
+        let real_amount_to_borrow = 0;
 
-         let sender = tx_context::sender(ctx);
-
-         let real_amount_to_borrow = 0;
-
-         if (table::contains(&state.users, sender)) {
+        if (table::contains(&state.users, sender)) {
             let userData = table::borrow_mut(&mut state.users, sender);
 
             if (table::contains(&userData.borrowed_amount, pool.asset_number)) {
                 let amount = table::borrow_mut(&mut userData.borrowed_amount, pool.asset_number);
-                *amount = *amount + amount_to_borrow
+                *amount = *amount + amount_to_borrow;
+                real_amount_to_borrow = amount_to_borrow;
             } else {
                 table::add(&mut userData.borrowed_amount, pool.asset_number, amount_to_borrow);
-            };
+                real_amount_to_borrow = amount_to_borrow;
+            }
 
-            real_amount_to_borrow = amount_to_borrow;
-         };
+            // Check if the user's health factor will remain above the liquidation threshold
+            let new_health_factor = calculate_health_factor(sender, state, price_feed);
+            assert!(new_health_factor >= LIQUIDATION_THRESHOLD, "Borrowing would cause the user's health factor to fall below the liquidation threshold");
+        }
 
-         let amount_to_borrow_balance = balance::split(
+        let amount_to_borrow_balance = balance::split(
             &mut pool.reserve, real_amount_to_borrow);
 
-         coin::from_balance(amount_to_borrow_balance, ctx)
+        coin::from_balance(amount_to_borrow_balance, ctx)
     }
 
     /*
@@ -326,7 +334,6 @@ module quest_overmind::lending {
         state: &mut ProtocolState,
         ctx: &mut TxContext
     ) {
-
         let sender = tx_context::sender(ctx);
         let coin_to_repay_balance = coin::into_balance(coin_to_repay);
         let value = balance::value(&coin_to_repay_balance);
@@ -342,7 +349,7 @@ module quest_overmind::lending {
                 assert!(*amount >= value, 2);
                 *amount = *amount - value;
             }
-        };
+        }
     }
 
     /*  
@@ -358,112 +365,121 @@ module quest_overmind::lending {
         state: &ProtocolState,
         price_feed: &dummy_oracle::PriceFeed
     ): u64 {
-        let collateral_total_amount = 0;
-        let borrowed_total_amount = 0;
-
-        if (table::contains(&state.users, user)) {
-
-            let userData = table::borrow(&state.users, user);
-
-            let i = 0;
-            while(i < state.number_of_pools) {
-
-                let (price, decimals) = dummy_oracle::get_price_and_decimals(i, price_feed);
-
-                if (table::contains(&userData.collateral_amount, i)) {
-                    let amount = table::borrow(&userData.collateral_amount, i);
-                    collateral_total_amount = collateral_total_amount + *amount / math::pow(10, decimals) * price ;
-                };
-
-                if (table::contains(&userData.borrowed_amount, i)) {
-                    let amount = table::borrow(&userData.borrowed_amount, i);
-                    borrowed_total_amount = borrowed_total_amount + *amount / math::pow(10, decimals) * price;
-                };
-
-                i = i+1;
-            }
-        };
+        let (collateral_total_amount, borrowed_total_amount) = get_user_total_amounts(user, state, price_feed);
 
         assert!(borrowed_total_amount != 0, 3);
 
-        collateral_total_amount * 80 / borrowed_total_amount
+        collateral_total_amount * LIQUIDATION_THRESHOLD / borrowed_total_amount
     }
 
-    public fun get_number_of_pools(state: &ProtocolState): u64 {
-        state.number_of_pools
-    }
+    // Helper function to calculate the total collateral and borrowed amounts for a user
+    fun get_user_total_amounts(
+        user: address,
+       state: &ProtocolState,
+       price_feed: &dummy_oracle::PriceFeed
+   ): (u64, u64) {
+       let collateral_total_amount = 0;
+       let borrowed_total_amount = 0;
 
-    public fun get_users(state: &ProtocolState): &Table<address, UserData> {
-        &state.users
-    }
+       if (table::contains(&state.users, user)) {
+           let userData = table::borrow(&state.users, user);
 
-    public fun get_pool_reserve<CoinType>(pool: &Pool<CoinType>): &Balance<CoinType>{
-        &pool.reserve
-    }
+           let i = 0;
+           while (i < state.number_of_pools) {
+               let (price, decimals) = dummy_oracle::get_price_and_decimals(i, price_feed);
 
-    public fun get_user_data_borrowed_amount(data: &UserData): &Table<u64, u64> {
-        &data.borrowed_amount
-    }
+               if (table::contains(&userData.collateral_amount, i)) {
+                   let amount = table::borrow(&userData.collateral_amount, i);
+                   collateral_total_amount = collateral_total_amount + *amount / math::pow(10, decimals) * price;
+               }
 
-    public fun get_user_data_collateral_amount(data: &UserData): &Table<u64, u64> {
-        &data.collateral_amount
-    }
+               if (table::contains(&userData.borrowed_amount, i)) {
+                   let amount = table::borrow(&userData.borrowed_amount, i);
+                   borrowed_total_amount = borrowed_total_amount + *amount / math::pow(10, decimals) * price;
+               }
 
-    #[test_only]
-    /// Wrapper of module initializer for testing
-    public fun test_init(ctx: &mut TxContext) {
-        init(ctx)
-    }
+               i = i + 1;
+           }
+       }
+
+       (collateral_total_amount, borrowed_total_amount)
+   }
+
+   public fun get_number_of_pools(state: &ProtocolState): u64 {
+       state.number_of_pools
+   }
+
+   public fun get_users(state: &ProtocolState): &Table<address, UserData> {
+       &state.users
+   }
+
+   public fun get_pool_reserve<CoinType>(pool: &Pool<CoinType>): &Balance<CoinType>{
+       &pool.reserve
+   }
+
+   public fun get_user_data_borrowed_amount(data: &UserData): &Table<u64, u64> {
+       &data.borrowed_amount
+   }
+
+   public fun get_user_data_collateral_amount(data: &UserData): &Table<u64, u64> {
+       &data.collateral_amount
+   }
+
+   #[test_only]
+   /// Wrapper of module initializer for testing
+   public fun test_init(ctx: &mut TxContext) {
+       init(ctx)
+   }
 }
 
 module quest_overmind::dummy_oracle {
+   //==============================================================================================
+   // Dependencies
+   //==============================================================================================
+   use std::vector;
+   use sui::transfer;
+   use sui::object::{Self, UID};
+   use sui::tx_context::TxContext;
 
-    //==============================================================================================
-    // Dependencies
-    //==============================================================================================
-    use std::vector;
-    use sui::transfer;
-    use sui::object::{Self, UID};
-    use sui::tx_context::TxContext;
+   struct PriceFeed has key {
+       id: UID,
+       prices: vector<u64>,
+       decimals: vector<u8>
+   }
 
-    struct PriceFeed has key {
-        id: UID, 
-        prices: vector<u64>,
-        decimals: vector<u8>
-    }
+   public fun init_module(ctx: &mut TxContext) {
+       transfer::share_object(
+           PriceFeed {
+               id: object::new(ctx),
+               prices: vector::empty(),
+               decimals: vector::empty()
+           }
+       );
+   }
 
-    public fun init_module(ctx: &mut TxContext) {
-        transfer::share_object(
-            PriceFeed {
-                id: object::new(ctx),
-                prices: vector::empty(),
-                decimals: vector::empty()
-            }
-        );
-    }
+   public fun add_new_coin(
+       price: u64,
+       decimals: u8,
+       feed: &mut PriceFeed
+   ) {
+       assert!(decimals >= 0 && decimals <= 9, "Decimal precision should be between 0 and 9");
+       vector::push_back(&mut feed.prices, price);
+       vector::push_back(&mut feed.decimals, decimals);
+   }
 
-    public fun add_new_coin(
-        price: u64,
-        decimals: u8,
-        feed: &mut PriceFeed
-    ) {
-        vector::push_back(&mut feed.prices, price);
-        vector::push_back(&mut feed.decimals, decimals);
-    }
+   public fun update_price(
+       new_price: u64,
+       coin_number: u64,
+       feed: &mut PriceFeed
+   ) {
+       let existing_price = vector::borrow_mut(&mut feed.prices, coin_number);
+       *existing_price = new_price;
+   }
 
-    public fun update_price(
-        new_price: u64,
-        coin_number: u64,
-        feed: &mut PriceFeed
-    ) {
-        let existing_price = vector::borrow_mut(&mut feed.prices, coin_number);
-        *existing_price = new_price;
-    }
-
-    public fun get_price_and_decimals(
-        coin_number: u64,
-        feed: &PriceFeed
-    ): (u64, u8) {
-        (*vector::borrow(&feed.prices, coin_number), *vector::borrow(&feed.decimals, coin_number))
-    }
+   public fun get_price_and_decimals(
+       coin_number: u64,
+       feed: &PriceFeed
+   ): (u64, u8) {
+       (*vector::borrow(&feed.prices, coin_number), *vector::borrow(&feed.decimals, coin_number))
+   }
 }
